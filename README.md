@@ -32,7 +32,7 @@ The pipeline covers the full dataset preparation workflow from repository discov
 - GitHub API integration to retrieve repository metadata
 - Repository filtering against quality criteria:
   - Minimum 50 GitHub stars
-  - Repository size between 50,000 KB and 1,000,000 KB
+  - Repository size between 500MB and 1GB
   - Supported programming language
   - Valid default branch
   - Valid licence information
