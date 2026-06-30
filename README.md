@@ -1,123 +1,74 @@
-# GitHub Source Code AI Dataset Collection and Curation Pipeline
+# GitHub Source Code AI Dataset Pipeline
 
-A large-scale GitHub repository scraping, filtering, and dataset curation pipeline designed to collect permissively licensed source code repositories, extract file-level source code and metadata, and prepare high-quality code datasets for AI and LLM training and research.
+An end-to-end pipeline for collecting, filtering, and curating a large-scale source code dataset from GitHub for LLM training and research, replicating and extending concepts from [The Stack v2](https://huggingface.co/datasets/bigcode/the-stack-v2). Built during a six-month AI Engineer internship at HTX, Singapore's national defence-tech agency. This was the largest project of the internship.
 
-This project replicates and extends concepts from datasets such as The Stack v2, with a focus on scalability, data quality, and reproducibility.
+## Scale
 
----
+- **5.5M+** GitHub repositories processed
+- **35M+** source files extracted
+- **600GB** of curated JSONL datasets produced
+- **~40B** raw tokens
 
-## Overview
+Repository data was collected across all twelve months of 2025, with cross-month deduplication ensuring no repository was collected more than once across the full year-long effort.
 
-The pipeline covers the full dataset preparation workflow from repository discovery through to curated JSONL dataset generation:
+## Pipeline overview
 
-- Discovering repositories via GH Archive event streams
-- Filtering repositories against predefined quality criteria
-- Cloning repositories and extracting source code at scale
-- Processing Jupyter Notebooks into clean, training-ready source code
-- Applying quality filters and deduplication using NVIDIA NeMo Curator
-- Producing structured JSONL datasets for LLM training and research
+### 1. Repository discovery (`gharchive.py`)
+Repository candidates are discovered by streaming [GH Archive](https://www.gharchive.org/) hourly event logs, filtering specifically for `PushEvent` and `CreateEvent` types.
 
-**Scale achieved:**
-- 5.5M+ GitHub repositories processed
-- 35M+ source files extracted
-- 600GB of curated JSONL code datasets generated
-- Approximately 40 billion raw code tokens collected
+### 2. Metadata enrichment and filtering (`github_helpers.py`)
+Each candidate repository is enriched via the GitHub REST API, accessed directly via `requests` (not a wrapper library, for finer-grained control over pagination, rate limits, and error handling). Four personal access tokens are rotated to increase the effective API throughput.
 
----
+Each repository must pass all of the following filters:
+- Minimum 50 GitHub stars
+- Repository size between approximately 50MB and 1GB
+- A supported programming language (see below)
+- A valid default branch
 
-## Pipeline Architecture
+### 3. Language filtering (`constants.py`, `language_helpers.py`)
+Rather than maintaining an inclusion list, the pipeline maintains an **exclusion list** of languages and file extensions considered unsuitable for code LLM training, following the methodology described in the Stack v2 paper. Excluded categories include non-code data formats (CSV, TSV, SVG, Diff files), CAD/3D formats, and a small number of specific languages excluded for relevance, including Go. A separate extension-based exclusion list filters out configuration files, lock files, and other non-source-code file types regardless of detected language.
 
-### 1. Repository Discovery
-- GH Archive event stream scraping to identify active repositories
-- GitHub API integration to retrieve repository metadata
-- Repository filtering against quality criteria:
-  - Minimum 50 GitHub stars
-  - Repository size between 500MB and 1GB
-  - Supported programming language
-  - Valid default branch
-  - Valid licence information
+### 4. Cloning (`github_helpers.py`)
+Repositories are cloned using **shallow clones** (`git clone --depth 1`) of the default branch only, to minimise bandwidth and storage. Large or irrelevant directories (`.git`, `node_modules`, `__pycache__`, virtual environments, IDE config folders) are excluded from scanning.
 
-### 2. Repository Processing
-- Automated repository cloning at scale
-- Checkpointing, retry handling, and resume mechanisms to handle GitHub API rate limits, cloning failures, and network timeouts
-- Source code extraction across multiple programming languages
+### 5. Jupyter Notebook handling (`jupyter_script.py`)
+Notebooks (`.ipynb`) are stored as JSON, not plain text, and require special handling:
+- Code cells are extracted; markdown and empty cells are discarded
+- Notebook-specific syntax (magic commands, shell escapes) is stripped from extracted code
+- Programming language is determined via a three-tier fallback: `metadata.language_info`, then `kernelspec.language`, then `kernelspec.name` (logged for review if this last, less reliable tier is used)
+- Notebooks with no extractable code or malformed JSON structure are skipped and logged rather than crashing the pipeline
 
-### 3. Jupyter Notebook Handling
-- Notebook language detection from repository metadata
-- Extraction of executable code cells only
-- Removal of notebook magic commands and shell commands
-- Exclusion of markdown cells
-- Conversion of notebooks into clean source code suitable for dataset generation
+### 6. Quality filtering (`filter.py`, using NVIDIA NeMo Curator)
+Five filters are applied: line-of-code bounds, alphabetic character ratio, XML header detection, HTML boilerplate detection, and tokenizer fertility (using a Codestral-22B tokenizer for this experiment). A regex-based pre-filter excludes malformed HTML before the HTML boilerplate filter runs. If the full filtering chain fails (commonly on malformed HTML), the pipeline falls back to running all filters except HTML filtering rather than losing the batch.
 
-### 4. Quality Filtering and Deduplication (NVIDIA NeMo Curator)
+### 7. Deduplication (`dedup.py`, using NVIDIA NeMo Curator)
+Both **exact** (content hashing) and **fuzzy** (character n-gram similarity) deduplication are applied, reducing memorisation risk from near-duplicate content that exact hashing alone would miss.
 
-**Quality Filters:**
-- `NumberOfLinesOfCodeFilter`
-- `AlphaFilter`
-- `XMLHeaderFilter`
-- `HTMLBoilerplateFilter`
-- `TokenizerFertilityFilter`
+## Resilience and infrastructure
 
-**Deduplication:**
-- Exact duplicate removal using hashing
-- Fuzzy duplicate removal using character n-gram similarity
+- Repository-level checkpointing and resume — interrupted runs pick up without reprocessing completed repositories
+- Cross-month duplicate checking across the full twelve-month collection effort
+- Per-file character encoding detection (via `chardet`), falling back to UTF-8
+- GPU-accelerated filtering with CPU fallback when CUDA/cuDF/CuPy environment configuration could not be reliably established
 
-### 5. Dataset Generation
-- Structured JSONL output format
-- One record per source file
-- Metadata-rich records for downstream filtering and research
+## Output schema
 
----
-
-## Dataset Schema
-
-Each JSONL record contains the following fields:
+Each record in the final JSONL dataset contains:
 
 ```json
 {
-  "repo_name": "example/repository",
-  "repo_description": "A sample Python project",
-  "stars": 245,
-  "file_count": 42,
-  "repo_size_kb": 15200,
+  "repo_name": "owner/repo",
+  "description": "...",
+  "stars": 1234,
+  "file_count": 56,
+  "size_kb": 75000,
   "language": "Python",
-  "license": "MIT",
-  "file_name": "main.py",
-  "text": "print('Hello, World!')"
+  "license": "mit",
+  "file_name": "src/main.py",
+  "text": "...extracted source code..."
 }
 ```
 
----
+## Tech stack
 
-## Engineering Challenges
-
-- **GitHub API rate limits** — Handled via rate-limit detection, exponential backoff, and resume mechanisms
-- **Repository cloning failures** — Managed through retry logic and checkpointing to allow interrupted runs to resume without reprocessing completed repositories
-- **Network timeouts** — Handled with configurable timeout thresholds and automatic retries
-- **Large-scale data processing** — Managed through parallel processing and memory-efficient streaming pipelines
-- **CUDA and GPU environment configuration** — Resolved environment issues during NVIDIA NeMo Curator integration and experimentation
-
----
-
-## Impact
-
-- Improved dataset quality and diversity through structured quality filtering
-- Reduced duplicate and low-quality code samples through exact and fuzzy deduplication
-- Reduced memorisation risk in future LLM training datasets
-- Created a scalable and reproducible foundation for future code LLM research and experimentation
-
----
-
-## Tech Stack
-
-- **Language:** Python
-- **Dataset Curation:** NVIDIA NeMo Curator
-- **Data Sources:** GH Archive, GitHub API
-- **Output Format:** JSONL
-- **Key Techniques:** Quality Filtering, Deduplication, Checkpointing, Retry Handling, Jupyter Notebook Processing
-
----
-
-## Notes
-
-This pipeline was built during an AI Engineer internship at the Home Team Science and Technology Agency (HTX), Singapore. The source code in this repository is a public representation of the pipeline architecture and design. Dataset outputs are not publicly available.
+Python, GitHub REST API, GH Archive, NVIDIA NeMo Curator, Dask, cuDF/CuPy (GPU-accelerated dataframes), JSONL
